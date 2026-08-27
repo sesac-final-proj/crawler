@@ -1,0 +1,17 @@
+*.csv
+*.xml
+*.bak
+
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.claude/
+
+# 파이썬 크롤러랑 무관한, 예전에 저장해둔 웹페이지 덤프
+서울 안전누리.html
+서울 안전누리_files/
