@@ -84,6 +84,8 @@ from appium.options.android import UiAutomator2Options
 from appium.webdriver.common.appiumby import AppiumBy
 from dotenv import load_dotenv
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
+from selenium.webdriver.common.actions import interaction
+from selenium.webdriver.common.actions.action_builder import ActionBuilder
 from selenium.webdriver.support.ui import WebDriverWait
 
 load_dotenv()  # .env의 HASH_SALT를 읽어옴 (dedup 해시용, 없어도 동작은 함)
@@ -96,6 +98,8 @@ BACK_WAIT_TIMEOUT = 1.5  # 목록 복귀 후 카드가 다시 보일 때까지 �
 SCROLL_WAIT = 0.9  # 스크롤 후 다음 배치가 그려질 때까지 대기
 SCROLL_PERCENT = 0.5  # 한 번에 스크롤하는 비율
 POLL_INTERVAL = 0.15
+VIEW_COUNT_MAX_SCROLLS = 8  # 상세화면에서 "조회 N" 찾을 때까지 스크롤할 최대 횟수(보통 1~2번 안에 찾음)
+VIEW_COUNT_SCROLL_WAIT = 0.5  # 상세화면 내부 스크롤 후 대기
 FIELDNAMES = [
     "카테고리", "검색어", "제목", "상태", "가격", "지역", "등록시각", "채팅수", "관심수",
     "조회수", "매너온도", "판매자닉네임", "상세카테고리", "거래희망장소", "상세설명",
@@ -333,7 +337,8 @@ def guess_meetup_place_from_desc(desc: str) -> str:
 def parse_detail_texts(texts: list[str]) -> dict:
     """상세화면에 보이는 TextView 텍스트 목록에서 설명/매너온도/닉네임/카테고리를 뽑는다.
 
-    조회수는 별도(단순 정규식 하나라 여기 안 넣음). 순서에 의존하는 항목들:
+    조회수는 별도(find_view_count) — 설명 아래 한참 스크롤해야 나오는 위치라 스크롤이
+    필요해서 스크롤 없이 한 번에 처리하는 이 함수엔 안 넣었다. 순서에 의존하는 항목들:
     - 매너온도: "46.9℃" 텍스트 바로 다음에 "매너온도" 라벨이 온다(실기기로 확인)
     - 판매자닉네임: 매너온도 값보다 두 칸 앞(라벨 기준 3칸 앞) — "<닉네임> <동네> <온도> 매너온도"
       순서로 항상 붙어 나온다(실기기 2건 덤프로 확인: "가을"/"양천구 신정7동", "1231910483"/
@@ -382,6 +387,61 @@ def parse_detail_texts(texts: list[str]) -> dict:
     }
 
 
+def _raw_swipe_up(driver, start_y_frac: float = 0.72, end_y_frac: float = 0.4, duration_ms: int = 300) -> None:
+    """W3C 포인터 액션으로 화면 중앙을 위로 쓸어올린다(터치 좌표 기반 진짜 스와이프).
+
+    "mobile: swipeGesture"(비율 기반 편의 명령)는 상세화면처럼 중첩 스크롤 구조가
+    있는 화면에서 처음 한 번만 스크롤되고 그 다음부터는 계속 호출해도 전혀 안
+    먹히는 걸 실기기로 확인했다(find_view_count가 계속 못 찾던 원인). 반면
+    `adb shell input swipe`와 같은 원리인 진짜 터치 좌표 누르기-끌기-떼기는
+    똑같은 화면에서 매번 정상적으로 스크롤됐다 — 그래서 이 방식으로 바꿨다.
+    """
+    size = driver.get_window_size()
+    x = size["width"] // 2
+    start_y = int(size["height"] * start_y_frac)
+    end_y = int(size["height"] * end_y_frac)
+    actions = ActionBuilder(driver)
+    finger = actions.add_pointer_input(interaction.POINTER_TOUCH, "finger")
+    finger.create_pointer_move(duration=0, x=x, y=start_y)
+    finger.create_pointer_down(button=0)
+    finger.create_pointer_move(duration=duration_ms, x=x, y=end_y)
+    finger.create_pointer_up(button=0)
+    actions.perform()
+
+
+def find_view_count(driver) -> str:
+    """상세화면에서 "채팅 N", "관심 N", "조회 N" 통계 줄(각각 별도 TextView) 중
+    "조회 N"을 찾을 때까지 아래로 스크롤한다.
+
+    설명 길이에 따라 화면 밖 아래에 있어서 상세화면 진입 직후 캡처만으론 못 찾는다
+    — Compose는 화면 밖 엘리먼트를 트리에 아예 안 올리기 때문에, 스크롤해서 실제로
+    그려지게 만들어야 한다.
+    상단 툴바(뒤로가기 등)는 스크롤해도 고정이라(실기기로 확인) 그 이후 목록 복귀
+    로직에는 영향 없다. 최대 스크롤 안에 못 찾으면 빈 값(광고/바로구매 등 통계
+    줄 자체가 없는 화면 대비 best-effort).
+
+    스크롤 직후는 Compose가 한창 다시 그리는 중이라 방금 조회한 엘리먼트가 바로
+    StaleElementReferenceException을 내는 게 실기기로 흔했다(목록 화면의
+    _find_next_unseen과 같은 문제) — 그래서 엘리먼트 하나하나, 그리고 스크롤
+    한 번한 번을 각각 try/except로 감싸서 하나 실패해도 다음 시도로 넘어간다.
+    """
+    for _ in range(VIEW_COUNT_MAX_SCROLLS):
+        try:
+            for tv in driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView"):
+                try:
+                    text = tv.get_attribute("text") or ""
+                except StaleElementReferenceException:
+                    continue
+                m = re.search(r"조회\s*(\d+)", text)
+                if m:
+                    return m.group(1)
+            _raw_swipe_up(driver)
+        except (StaleElementReferenceException, WebDriverException):
+            pass  # 스크롤 직후 화면이 흔들려도 다음 시도에서 다시 잡힘
+        time.sleep(VIEW_COUNT_SCROLL_WAIT)
+    return ""
+
+
 def scrape_detail(driver, button) -> dict:
     """카드를 탭해 상세화면 진입 → 설명/조회수/매너온도/카테고리 수집 → 목록 복귀 시도.
 
@@ -404,11 +464,7 @@ def scrape_detail(driver, button) -> dict:
         texts = [tv.get_attribute("text") or "" for tv in text_views]
         detail.update(parse_detail_texts(texts))
 
-        for v in texts:
-            m = re.search(r"조회\s*(\d+)", v)
-            if m:
-                detail["조회수"] = m.group(1)
-                break
+        detail["조회수"] = find_view_count(driver)
     except (StaleElementReferenceException, WebDriverException):
         pass  # ponytail: 상세정보는 부가정보라 실패해도 목록 수집은 계속
     finally:
