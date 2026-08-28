@@ -5,14 +5,21 @@ from datetime import datetime, timedelta
 
 from danggeun_android_app_crawler import (
     FIELDNAMES,
+    bootstrap_dedup_keys_from_csv,
     guess_meetup_place_from_desc,
     is_excluded,
-    load_existing_keys,
+    load_dedup_keys,
+    make_dedup_key,
     parse_detail_texts,
     parse_listing_label,
     resolve_reg_date,
     save_csv,
+    save_dedup_keys,
 )
+
+
+def _blank_detail() -> dict:
+    return {"상세설명": "", "매너온도": "", "판매자닉네임": "", "상세카테고리": "", "거래희망장소": ""}
 
 
 def test_parse_listing_label_basic():
@@ -76,9 +83,20 @@ def test_parse_detail_texts():
     ]
     info = parse_detail_texts(texts)
     assert info["매너온도"] == "37.4℃"
+    assert info["판매자닉네임"] == "가을"
     assert info["상세카테고리"] == "생활가전"
     assert info["거래희망장소"] == "갈산도서관"
     assert info["상세설명"] == "선물 받은건데\n개봉만 하고 비닐도 안열어본 제품입니다"
+
+
+def test_parse_detail_texts_nickname_survives_leading_banner():
+    # "집 앞으로 배송받는 바로구매 물품이에요." 같은 배너가 앞에 껴도 매너온도 기준
+    # 상대 위치(3칸 앞)라 안 흔들려야 함 — 실기기 덤프(daangn_app_result_images 계열) 재현
+    texts = [
+        "1 / 3", "집 앞으로 배송받는 바로구매 물품이에요.",
+        "1231910483", "양천구 목4동", "46.9℃", "매너온도",
+    ]
+    assert parse_detail_texts(texts)["판매자닉네임"] == "1231910483"
 
 
 def test_guess_meetup_place_from_desc():
@@ -96,9 +114,7 @@ def test_parse_detail_texts_falls_back_to_desc_for_meetup_place():
 
 def test_parse_detail_texts_missing_fields_stay_empty():
     # 판매자가 거래 희망 장소를 안 정해두면 라벨 자체가 없다 — 빈 값이어야 함
-    assert parse_detail_texts(["아무 상관 없는 텍스트"]) == {
-        "상세설명": "", "매너온도": "", "상세카테고리": "", "거래희망장소": "",
-    }
+    assert parse_detail_texts(["아무 상관 없는 텍스트"]) == _blank_detail()
 
 
 def test_is_excluded():
@@ -115,19 +131,44 @@ def test_resolve_reg_date():
     assert resolve_reg_date("2개월 전", now) == (now - timedelta(days=60)).strftime("%Y-%m-%d")
 
 
-def test_load_existing_keys():
-    # 파일이 없으면 빈 set (첫 실행)
-    assert load_existing_keys("/tmp/does-not-exist-daangn.csv") == set()
+def test_make_dedup_key_ignores_region_but_not_title_or_price():
+    # 지역(동)은 일부러 키에서 뺐다 — 인접한 동에서 2km 반경으로 겹쳐 수집해도
+    # 같은 매물(제목+가격 동일)이면 같은 키가 나와야 중복으로 잡힌다
+    k1 = make_dedup_key("메쉬 의자", "10,000원")
+    k2 = make_dedup_key("메쉬 의자", "10,000원")
+    assert k1 == k2  # 결정적(deterministic)이어야 함
+    assert k1 != make_dedup_key("메쉬 의자", "20,000원")  # 가격 다르면 다른 키
+    assert k1 != make_dedup_key("다른 의자", "10,000원")  # 제목 다르면 다른 키
+
+
+def test_load_dedup_keys_missing_file_is_empty_set():
+    assert load_dedup_keys("/tmp/does-not-exist-daangn.keys") == set()
+
+
+def test_save_and_load_dedup_keys_roundtrip():
+    fd, path = tempfile.mkstemp(suffix=".keys")
+    os.close(fd)
+    try:
+        save_dedup_keys({"key-a", "key-b"}, path)
+        assert load_dedup_keys(path) == {"key-a", "key-b"}
+        save_dedup_keys({"key-c"}, path)  # 이어붙이기 — 기존 키 안 지워짐
+        assert load_dedup_keys(path) == {"key-a", "key-b", "key-c"}
+    finally:
+        os.remove(path)
+
+
+def test_bootstrap_dedup_keys_from_csv():
+    # .keys 파일이 없는데 기존 CSV는 있는 마이그레이션 상황 — CSV에서 키를 역산해야 함
+    assert bootstrap_dedup_keys_from_csv("/tmp/does-not-exist-daangn.csv") == set()
 
     fd, path = tempfile.mkstemp(suffix=".csv")
     os.close(fd)
     try:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=["카테고리", "검색어", "제목", "가격", "지역", "등록시각"])
+            writer = csv.DictWriter(f, fieldnames=["제목", "가격"])
             writer.writeheader()
-            writer.writerow({"카테고리": "가구,인테리어", "검색어": "의자", "제목": "메쉬 의자", "가격": "10,000원", "지역": "문래동", "등록시각": "2026-08-25"})
-        keys = load_existing_keys(path)
-        assert keys == {("메쉬 의자", "10,000원", "문래동")}
+            writer.writerow({"제목": "메쉬 의자", "가격": "10,000원"})
+        assert bootstrap_dedup_keys_from_csv(path) == {make_dedup_key("메쉬 의자", "10,000원")}
     finally:
         os.remove(path)
 
@@ -174,12 +215,16 @@ if __name__ == "__main__":
     test_parse_listing_label_rejects_ads()
     test_parse_listing_label_status()
     test_parse_detail_texts()
+    test_parse_detail_texts_nickname_survives_leading_banner()
     test_guess_meetup_place_from_desc()
     test_parse_detail_texts_falls_back_to_desc_for_meetup_place()
     test_parse_detail_texts_missing_fields_stay_empty()
     test_is_excluded()
     test_resolve_reg_date()
-    test_load_existing_keys()
+    test_make_dedup_key_ignores_region_but_not_title_or_price()
+    test_load_dedup_keys_missing_file_is_empty_set()
+    test_save_and_load_dedup_keys_roundtrip()
+    test_bootstrap_dedup_keys_from_csv()
     test_save_csv_refuses_to_append_onto_mismatched_header()
     test_save_csv_appends_when_header_matches()
     print("OK")

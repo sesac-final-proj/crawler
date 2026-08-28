@@ -10,9 +10,16 @@ import하지 않으므로 한쪽을 고쳐도 다른 쪽에 영향 없다.
 ("<제목> 거래중 <지역> <N분 전> 가격 <가격> 채팅<N> 관심<N> <거리>")으로 들어있다.
 
 카드를 클릭해 상세화면(ArticleDetailActivity)까지 들어가 설명/조회수/매너온도/
-카테고리도 긁는다. 이미지는 시도해봤지만 ImageView의 content-desc/resource-id가
-전부 비어 있고 URL 문자열도 트리 어디에도 없어서(실기기로 확인) 링크 형태로 못
-가져온다 — 그래서 아예 수집하지 않는다.
+판매자닉네임/카테고리도 긁는다. 이미지는 시도해봤지만 ImageView의 content-desc/
+resource-id가 전부 비어 있고 URL 문자열도 트리 어디에도 없어서(실기기로 확인)
+링크 형태로 못 가져온다 — 그래서 아예 수집하지 않는다.
+
+구 단위로 데이터를 모으고 싶지만 당근 앱 자체가 "동" 기준 반경 검색이라 동마다
+따로 돌려야 한다(--dong으로 기록만 하고 실제 검색은 폰에서 수동). 인접한 동을
+2km 반경으로 겹쳐 돌리면 같은 매물이 여러 번 잡힐 수 있어서, 제목+가격 해시를
+"daangn_<검색어>_<구>.keys" 파일에 모아두고 이미 있는 키는 상세화면에 들어가지도
+않고 건너뛴다(make_dedup_key/load_dedup_keys/save_dedup_keys 참고). 해시에 섞는
+salt는 .env의 HASH_SALT.
 
 단, 실기기로 여러 번 검증한 결과 이 앱은 상세화면에서 목록으로 돌아오는 길이
 근본적으로 불안정하다:
@@ -55,16 +62,18 @@ SETUP (최초 1회)
    예) ANDROID_HOME=~/Library/Android/sdk appium --base-path / --port 4723
 8. 이 스크립트 실행
 
-실행 예:
+실행 예 (동마다 한 번씩, 같은 --gu로 계속 돌리면 자동으로 이어붙고 중복은 스킵됨):
   ./.venv/bin/python crawler/danggeun_android_app_crawler.py \
     --udid R3CM901Q10N \
     --category "가구,인테리어" --keyword 의자 \
-    --output daangn_android_categorized.csv \
+    --gu 영등포구 --dong 문래동 \
     --exclude 케이스 파우치
+  # → daangn_의자_영등포구.csv / daangn_의자_영등포구.keys 에 저장
 """
 
 import argparse
 import csv
+import hashlib
 import os
 import re
 import time
@@ -73,8 +82,13 @@ from datetime import datetime, timedelta
 from appium import webdriver
 from appium.options.android import UiAutomator2Options
 from appium.webdriver.common.appiumby import AppiumBy
+from dotenv import load_dotenv
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
+from selenium.webdriver.common.actions import interaction
+from selenium.webdriver.common.actions.action_builder import ActionBuilder
 from selenium.webdriver.support.ui import WebDriverWait
+
+load_dotenv()  # .env의 HASH_SALT를 읽어옴 (dedup 해시용, 없어도 동작은 함)
 
 APP_PACKAGE = "com.towneers.www"
 MAX_SCROLLS = 200  # ponytail: 안전장치용 상한
@@ -84,9 +98,11 @@ BACK_WAIT_TIMEOUT = 1.5  # 목록 복귀 후 카드가 다시 보일 때까지 �
 SCROLL_WAIT = 0.9  # 스크롤 후 다음 배치가 그려질 때까지 대기
 SCROLL_PERCENT = 0.5  # 한 번에 스크롤하는 비율
 POLL_INTERVAL = 0.15
+VIEW_COUNT_MAX_SCROLLS = 8  # 상세화면에서 "조회 N" 찾을 때까지 스크롤할 최대 횟수(보통 1~2번 안에 찾음)
+VIEW_COUNT_SCROLL_WAIT = 0.5  # 상세화면 내부 스크롤 후 대기
 FIELDNAMES = [
     "카테고리", "검색어", "제목", "상태", "가격", "지역", "등록시각", "채팅수", "관심수",
-    "조회수", "매너온도", "상세카테고리", "거래희망장소", "상세설명",
+    "조회수", "매너온도", "판매자닉네임", "상세카테고리", "거래희망장소", "상세설명",
 ]
 
 # 매물 카드의 accessibility text 포맷을 파싱.
@@ -319,10 +335,14 @@ def guess_meetup_place_from_desc(desc: str) -> str:
 
 
 def parse_detail_texts(texts: list[str]) -> dict:
-    """상세화면에 보이는 TextView 텍스트 목록에서 설명/매너온도/카테고리를 뽑는다.
+    """상세화면에 보이는 TextView 텍스트 목록에서 설명/매너온도/닉네임/카테고리를 뽑는다.
 
-    조회수는 별도(단순 정규식 하나라 여기 안 넣음). 순서에 의존하는 항목들:
+    조회수는 별도(find_view_count) — 설명 아래 한참 스크롤해야 나오는 위치라 스크롤이
+    필요해서 스크롤 없이 한 번에 처리하는 이 함수엔 안 넣었다. 순서에 의존하는 항목들:
     - 매너온도: "46.9℃" 텍스트 바로 다음에 "매너온도" 라벨이 온다(실기기로 확인)
+    - 판매자닉네임: 매너온도 값보다 두 칸 앞(라벨 기준 3칸 앞) — "<닉네임> <동네> <온도> 매너온도"
+      순서로 항상 붙어 나온다(실기기 2건 덤프로 확인: "가을"/"양천구 신정7동", "1231910483"/
+      "양천구 목4동"). 위에 배송 배너 등 다른 줄이 껴도 매너온도 기준 상대 위치라 안 흔들림.
     - 카테고리: "뷰티/미용" 다음에 " · 끌올 1시간 전"처럼 "·"로 시작하는 텍스트가 온다
     - 거래희망장소: "거래 희망 장소" 라벨 바로 다음에 실제 장소 텍스트가 온다 —
       판매자가 안 정해두면 라벨 자체가 없어서 빈 값(직거래 아닌 바로구매 매물도 마찬가지)
@@ -334,9 +354,12 @@ def parse_detail_texts(texts: list[str]) -> dict:
             desc = v
 
     manner_temp = ""
+    nickname = ""
     for i, v in enumerate(texts):
         if v.strip() == "매너온도" and i > 0 and re.match(r"^-?\d+(?:\.\d+)?℃$", texts[i - 1].strip()):
             manner_temp = texts[i - 1].strip()
+            if i >= 3:
+                nickname = texts[i - 3].strip()
             break
 
     category = ""
@@ -358,9 +381,65 @@ def parse_detail_texts(texts: list[str]) -> dict:
     return {
         "상세설명": desc,
         "매너온도": manner_temp,
+        "판매자닉네임": nickname,
         "상세카테고리": category,
         "거래희망장소": meetup_place,
     }
+
+
+def _raw_swipe_up(driver, start_y_frac: float = 0.72, end_y_frac: float = 0.4, duration_ms: int = 300) -> None:
+    """W3C 포인터 액션으로 화면 중앙을 위로 쓸어올린다(터치 좌표 기반 진짜 스와이프).
+
+    "mobile: swipeGesture"(비율 기반 편의 명령)는 상세화면처럼 중첩 스크롤 구조가
+    있는 화면에서 처음 한 번만 스크롤되고 그 다음부터는 계속 호출해도 전혀 안
+    먹히는 걸 실기기로 확인했다(find_view_count가 계속 못 찾던 원인). 반면
+    `adb shell input swipe`와 같은 원리인 진짜 터치 좌표 누르기-끌기-떼기는
+    똑같은 화면에서 매번 정상적으로 스크롤됐다 — 그래서 이 방식으로 바꿨다.
+    """
+    size = driver.get_window_size()
+    x = size["width"] // 2
+    start_y = int(size["height"] * start_y_frac)
+    end_y = int(size["height"] * end_y_frac)
+    actions = ActionBuilder(driver)
+    finger = actions.add_pointer_input(interaction.POINTER_TOUCH, "finger")
+    finger.create_pointer_move(duration=0, x=x, y=start_y)
+    finger.create_pointer_down(button=0)
+    finger.create_pointer_move(duration=duration_ms, x=x, y=end_y)
+    finger.create_pointer_up(button=0)
+    actions.perform()
+
+
+def find_view_count(driver) -> str:
+    """상세화면에서 "채팅 N", "관심 N", "조회 N" 통계 줄(각각 별도 TextView) 중
+    "조회 N"을 찾을 때까지 아래로 스크롤한다.
+
+    설명 길이에 따라 화면 밖 아래에 있어서 상세화면 진입 직후 캡처만으론 못 찾는다
+    — Compose는 화면 밖 엘리먼트를 트리에 아예 안 올리기 때문에, 스크롤해서 실제로
+    그려지게 만들어야 한다.
+    상단 툴바(뒤로가기 등)는 스크롤해도 고정이라(실기기로 확인) 그 이후 목록 복귀
+    로직에는 영향 없다. 최대 스크롤 안에 못 찾으면 빈 값(광고/바로구매 등 통계
+    줄 자체가 없는 화면 대비 best-effort).
+
+    스크롤 직후는 Compose가 한창 다시 그리는 중이라 방금 조회한 엘리먼트가 바로
+    StaleElementReferenceException을 내는 게 실기기로 흔했다(목록 화면의
+    _find_next_unseen과 같은 문제) — 그래서 엘리먼트 하나하나, 그리고 스크롤
+    한 번한 번을 각각 try/except로 감싸서 하나 실패해도 다음 시도로 넘어간다.
+    """
+    for _ in range(VIEW_COUNT_MAX_SCROLLS):
+        try:
+            for tv in driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView"):
+                try:
+                    text = tv.get_attribute("text") or ""
+                except StaleElementReferenceException:
+                    continue
+                m = re.search(r"조회\s*(\d+)", text)
+                if m:
+                    return m.group(1)
+            _raw_swipe_up(driver)
+        except (StaleElementReferenceException, WebDriverException):
+            pass  # 스크롤 직후 화면이 흔들려도 다음 시도에서 다시 잡힘
+        time.sleep(VIEW_COUNT_SCROLL_WAIT)
+    return ""
 
 
 def scrape_detail(driver, button) -> dict:
@@ -372,7 +451,7 @@ def scrape_detail(driver, button) -> dict:
     링크 형태로 못 가져온다 — 그래서 아예 수집하지 않는다.
     나머지 항목도 못 찾으면 빈 값으로 둔다.
     """
-    detail = {"상세설명": "", "조회수": "", "매너온도": "", "상세카테고리": "", "거래희망장소": ""}
+    detail = {"상세설명": "", "조회수": "", "매너온도": "", "판매자닉네임": "", "상세카테고리": "", "거래희망장소": ""}
     try:
         button.click()
         _wait_until(
@@ -385,11 +464,7 @@ def scrape_detail(driver, button) -> dict:
         texts = [tv.get_attribute("text") or "" for tv in text_views]
         detail.update(parse_detail_texts(texts))
 
-        for v in texts:
-            m = re.search(r"조회\s*(\d+)", v)
-            if m:
-                detail["조회수"] = m.group(1)
-                break
+        detail["조회수"] = find_view_count(driver)
     except (StaleElementReferenceException, WebDriverException):
         pass  # ponytail: 상세정보는 부가정보라 실패해도 목록 수집은 계속
     finally:
@@ -409,8 +484,10 @@ def _find_next_unseen(
 ) -> tuple | None:
     """현재 화면에서 아직 안 긁은 카드 하나를 찾아 (버튼엘리먼트, info, key)로 반환. 없으면 None.
 
-    already_seen_keys: 이전 실행에서 이미 CSV에 저장된 매물 키 — 다시 만나도
-    상세화면에 들어가지 않고 건너뛴다(중복 게시글 크롤링 방지).
+    already_seen_keys: 이전 실행에서 이미 .keys 파일에 저장된 매물 해시 키 — 다시
+    만나도 상세화면에 들어가지 않고 건너뛴다(중복 게시글 크롤링 방지). 인접한 동을
+    2km 반경으로 나눠 돌리면 같은 매물이 여러 번 잡힐 수 있어서(구 단위로 모을
+    계획이라) 지역(동)은 키에서 빼고 제목+가격만 쓴다 — make_dedup_key 참고.
 
     header_bottom: 상단 검색창/탭바에 가려진 카드는 클릭하면 실제로는 헤더가
     눌리므로 아예 후보에서 제외한다.
@@ -423,8 +500,7 @@ def _find_next_unseen(
         info = parse_listing_label(text)
         if not info or is_excluded(info["제목"], exclude_keywords):
             continue
-        # ponytail: 등록시각은 다시 마주칠 때마다 값이 바뀌어서 키에서 뺀다 (iOS 버전과 동일 이유)
-        key = (info["제목"], info["가격"], info["지역"])
+        key = make_dedup_key(info["제목"], info["가격"])
         if key in seen or key in already_seen_keys:
             continue
         try:
@@ -437,12 +513,47 @@ def _find_next_unseen(
     return None
 
 
-def load_existing_keys(path: str) -> set:
-    """저장된 CSV에서 (제목,가격,지역) 키를 읽어와 중복 크롤링 방지에 쓴다."""
+def make_dedup_key(title: str, price: str) -> str:
+    """제목+가격 조합의 해시. 지역(동)은 일부러 뺐다 — 같은 매물을 인접한 동에서 2km
+    반경으로 겹쳐 수집해도(구 단위로 모을 계획이라 동마다 따로 돌림) 동일한 키가
+    나와야 중복으로 잡히기 때문. 보안 목적 해시가 아니라 그냥 지문(fingerprint)이라
+    salt도 비밀값이 아니라 재현성 확인용 — .env의 HASH_SALT로 바꿀 수 있다.
+    """
+    salt = os.environ.get("HASH_SALT", "")
+    return hashlib.sha256(f"{salt}:{title}:{price}".encode("utf-8")).hexdigest()
+
+
+def load_dedup_keys(path: str) -> set[str]:
+    """키 저장 파일(한 줄에 해시 하나)을 읽어 set으로 반환.
+
+    CSV를 매번 다시 파싱하는 것보다 빠르다 — 상세설명 컬럼에 개행이 많이 섞여 있어
+    csv.DictReader로 전체를 읽는 게 상대적으로 무겁다. 그래서 dedup 전용으로 가벼운
+    파일을 따로 둔다(훑기 빠른 형식).
+    """
     if not os.path.exists(path):
         return set()
-    with open(path, encoding="utf-8-sig") as f:
-        return {(r["제목"], r["가격"], r["지역"]) for r in csv.DictReader(f)}
+    with open(path, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def save_dedup_keys(keys: set[str], path: str) -> None:
+    """새로 생긴 키만 이어붙인다(save_csv와 같은 이어붙이기 방식)."""
+    if not keys:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.writelines(f"{k}\n" for k in keys)
+
+
+def bootstrap_dedup_keys_from_csv(csv_path: str) -> set[str]:
+    """.keys 파일이 아직 없는데 기존 CSV는 있을 때(이 dedup 방식으로 막 넘어온 경우)
+    CSV의 제목·가격으로 해시를 다시 계산해 키 세트를 만든다. 안 하면 이미 모아둔
+    매물이 다음 실행에서 또 중복으로 쌓인다 — load_dedup_keys가 빈 파일로 보고
+    전부 새 매물 취급하기 때문.
+    """
+    if not os.path.exists(csv_path):
+        return set()
+    with open(csv_path, encoding="utf-8-sig") as f:
+        return {make_dedup_key(r["제목"], r["가격"]) for r in csv.DictReader(f)}
 
 
 def crawl(
@@ -464,7 +575,7 @@ def crawl(
     }
     header_bottom = get_header_bottom(driver, size["height"])
 
-    seen: dict[tuple, dict] = {}
+    seen: dict[str, dict] = {}  # 키는 make_dedup_key()가 만든 해시 문자열
     stale_count = 0
 
     for _ in range(max_scrolls):
@@ -527,7 +638,16 @@ def main():
     parser.add_argument("--keyword", required=True, help="폰에 미리 입력해둔 검색어 (예: 의자)")
     parser.add_argument("--appium-url", default="http://127.0.0.1:4723", help="Appium 서버 주소")
     parser.add_argument("--exclude", nargs="*", default=[], help="제목에 포함되면 제외할 키워드")
-    parser.add_argument("--output", default="daangn_android_categorized.csv", help="저장할 CSV 경로 (이미 있으면 이어붙임)")
+    parser.add_argument("--gu", required=True, help='구 이름 (예: "영등포구") — 출력 파일명에 쓰임')
+    parser.add_argument(
+        "--dong", default="",
+        help="이번 실행에서 실제로 검색한 동 이름(기록용, 로그에만 찍힘) — 당근 특성상 동 단위로 "
+             "돌려야 해서 같은 --gu를 여러 동으로 나눠 실행할 때 어느 동인지 구분하는 용도",
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="저장할 CSV 경로 (기본: daangn_<검색어>_<구>.csv, 이미 있으면 이어붙임)",
+    )
     parser.add_argument(
         "--max-scrolls", type=int, default=MAX_SCROLLS,
         help=f"최대 스크롤 횟수 (기본 {MAX_SCROLLS}, 안전장치용 상한이라 보통 이거 전에 stale로 끝남)",
@@ -539,7 +659,19 @@ def main():
     )
     args = parser.parse_args()
 
-    already_seen_keys = load_existing_keys(args.output)
+    output = args.output or f"daangn_{args.keyword}_{args.gu}.csv"
+    # ponytail: keys 경로는 --output을 바꿔도 검색어+구 기준으로 고정 — 구 단위로 여러 번
+    # 나눠 돌려도(동마다 한 번씩) 같은 dedup 저장소를 계속 같이 쓰게 하려는 것
+    keys_path = f"daangn_{args.keyword}_{args.gu}.keys"
+
+    if os.path.exists(keys_path):
+        already_seen_keys = load_dedup_keys(keys_path)
+    else:
+        # 이 dedup 방식으로 막 넘어온 경우 — 기존 CSV가 있으면 거기서 키를 역산해 시드
+        already_seen_keys = bootstrap_dedup_keys_from_csv(output)
+
+    if args.dong:
+        print(f"[{args.gu} / {args.dong}] '{args.keyword}' 검색 시작 (기존 dedup 키 {len(already_seen_keys)}개)")
 
     driver = make_driver(args.appium_url, args.udid)
     try:
@@ -551,8 +683,10 @@ def main():
         row["카테고리"] = args.category
         row["검색어"] = args.keyword
 
-    save_csv(rows, args.output)
-    print(f"[{args.category} / {args.keyword}] {len(rows)}건 저장 완료 → {args.output}")
+    save_csv(rows, output)
+    new_keys = {make_dedup_key(row["제목"], row["가격"]) for row in rows}
+    save_dedup_keys(new_keys, keys_path)
+    print(f"[{args.category} / {args.keyword}] {len(rows)}건 저장 완료 → {output} (dedup 키 {len(new_keys)}개 추가 → {keys_path})")
     if not rows:
         print("0건입니다 — 폰이 검색결과 목록 화면(WebView 아님)이 맞는지 확인 후 다시 실행해주세요.")
 

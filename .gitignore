@@ -1,6 +1,7 @@
 *.csv
 *.xml
 *.bak
+*.keys
 
 __pycache__/
 *.py[cod]
