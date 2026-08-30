@@ -71,7 +71,16 @@ def main():
     driver = make_driver(args.appium_url, args.udid)
     try:
         for dong in args.dongs:
-            if not add_dong(driver, dong):
+            try:
+                added = add_dong(driver, dong)
+            except WebDriverException as e:
+                # ponytail: Appium 서버가 잠깐 응답을 놓치는 경우(socket hang up 등)를
+                # 실기기 배치 실행 중 확인했다 — add_dong도 crawl()과 똑같이 방어해야
+                # 이 동 하나 때문에 나머지 --dongs가 통째로 죽는 걸 막을 수 있음
+                print(f"'{dong}' 처리 중 오류로 건너뜁니다: {e}")
+                skipped_dongs.append(dong)
+                continue
+            if not added:
                 print(f"'{dong}' 동네를 검색/등록하지 못했습니다 — 건너뜁니다 (동 이름 철자를 확인해보세요).")
                 skipped_dongs.append(dong)
                 continue

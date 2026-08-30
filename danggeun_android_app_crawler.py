@@ -249,11 +249,18 @@ def _find_dong_label(driver):
 
     resource-id가 없어서(웹뷰) content-desc가 동/구/읍/면/리로 끝나는 첫 View를
     쓴다 — _LOCATION_RE는 매물 카드의 지역 파싱에도 쓰는 같은 패턴(실기기 확인).
+    동네가 1개만 등록돼 있으면 이 라벨이 content-desc 방식이 아니라 평범한
+    TextView 텍스트로 렌더링된다는 걸 실기기로 확인했다(동네 2개일 때와 UI 컴포넌트
+    자체가 다름) — 그 경우를 위한 폴백.
     """
     for v in driver.find_elements(AppiumBy.CLASS_NAME, "android.view.View"):
         desc = v.get_attribute("content-desc") or ""
         if _LOCATION_RE.match(desc):
             return v
+    for tv in driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView"):
+        text = (tv.get_attribute("text") or "").strip()
+        if _LOCATION_RE.match(text):
+            return tv
     return None
 
 
