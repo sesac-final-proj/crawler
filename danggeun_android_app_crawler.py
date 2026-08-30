@@ -207,14 +207,24 @@ def _find_flea_market_tab(driver):
     return tabs[0] if tabs else None
 
 
-def ensure_flea_market_tab(driver) -> None:
-    """상단 탭을 "전체"가 아니라 "중고거래"로 맞춘다. 이미 선택돼 있으면 아무 것도 안 함."""
-    tab = _find_flea_market_tab(driver)
-    if not tab:
-        return  # ponytail: 탭이 안 보이는 화면이면 그냥 건너뜀 — main()의 0건 안내가 커버
-    if tab.get_attribute("selected") != "true":
-        tab.click()
-        time.sleep(1.0)
+def ensure_flea_market_tab(driver, max_attempts: int = 3) -> None:
+    """상단 탭을 "전체"가 아니라 "중고거래"로 맞춘다. 이미 선택돼 있으면 아무 것도 안 함.
+
+    검색 직후처럼 화면이 막 다시 그려지는 타이밍에 이 탭이 StaleElementReference를
+    내는 걸 배치 러너 실사용 중 확인했다(이전엔 방어가 없어서 배치 전체가 죽었음) —
+    _find_next_unseen 등 다른 곳과 같은 패턴으로 재시도한다.
+    """
+    for _ in range(max_attempts):
+        tab = _find_flea_market_tab(driver)
+        if not tab:
+            return  # ponytail: 탭이 안 보이는 화면이면 그냥 건너뜀 — main()의 0건 안내가 커버
+        try:
+            if tab.get_attribute("selected") != "true":
+                tab.click()
+                time.sleep(1.0)
+            return
+        except (StaleElementReferenceException, WebDriverException):
+            time.sleep(0.3)
 
 
 def get_header_bottom(driver, window_height: int) -> int:
@@ -306,6 +316,81 @@ def switch_to_dong(driver, dong: str) -> bool:
             return True
     driver.back()
     return False
+
+
+def add_dong(driver, dong: str, keep: str = "") -> bool:
+    """등록 안 된 동이면 "동네 추가" 검색으로 새로 등록하고 활성 동네로 전환한다.
+
+    당근 "동네 추가"는 GPS 인증 없이 텍스트 검색 -> 결과 선택만으로 바로
+    등록/전환된다는 걸 실기기로 확인했다 — switch_to_dong을 만들 때 "새 동네는
+    GPS 인증이 필요해서 스크립트로 등록 못 한다"고 가정했는데 틀렸다("내 위치로
+    찾기" 버튼 얘기와 검색은 별개 경로였음). 최대 2개 슬롯이라 이미 꽉 차 있으면
+    keep으로 지정한 동은 남기고 나머지 한 슬롯을 지운 뒤 새로 추가한다.
+    """
+    _go_home(driver)
+    if switch_to_dong(driver, dong):
+        return True  # 이미 등록돼 있었음
+
+    label = _find_dong_label(driver)
+    if not label:
+        return False
+    label.click()
+    time.sleep(0.8)
+
+    add_btn = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().description("동네 추가")')
+    if not add_btn:
+        # "동네 추가"가 안 보이면 슬롯(최대 2개)이 꽉 찬 상태 — keep이 아닌 동의
+        # "닫기"를 눌러 자리를 비운다. 이름 텍스트와 같은 행(y좌표가 가까운)의
+        # 닫기 버튼을 찾는다 — resource-id가 없는 웹뷰라 좌표로 짝지을 수밖에 없음.
+        removed = False
+        for tv in driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView"):
+            name = (tv.get_attribute("text") or "").strip()
+            if not name or name == keep or not _LOCATION_RE.match(name):
+                continue
+            ty = tv.rect["y"] + tv.rect["height"] / 2
+            for x in driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().description("닫기")'):
+                xy = x.rect["y"] + x.rect["height"] / 2
+                if abs(xy - ty) < 30:
+                    x.click()
+                    time.sleep(0.6)
+                    # "'OO동'을 삭제할까요?" 확인 다이얼로그가 뜬다(실기기 확인) — 삭제 확정
+                    confirm = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().description("삭제")')
+                    if confirm:
+                        confirm[0].click()
+                        time.sleep(0.8)
+                    removed = True
+                    break
+            if removed:
+                break
+        if not removed:
+            driver.back()
+            return False
+        add_btn = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().description("동네 추가")')
+        if not add_btn:
+            driver.back()
+            return False
+
+    add_btn[0].click()
+    _wait_until(
+        driver, lambda d: len(d.find_elements(AppiumBy.CLASS_NAME, "android.widget.EditText")) > 0, DETAIL_WAIT_TIMEOUT
+    )
+    edits = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.EditText")
+    if not edits:
+        return False
+    edits[0].send_keys(dong)
+    time.sleep(1.2)  # 검색 결과가 뜰 때까지(디바운스) — 실기기로 확인한 여유값
+
+    # "서울 <구> 당산동1가" 같은 하위 항목도 "당산동"을 포함해서 걸리므로, 동 이름으로
+    # 정확히 끝나는(=정확히 그 동인) 결과만 고른다.
+    candidates = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, f'new UiSelector().textContains("{dong}")')
+    exact = [c for c in candidates if (c.get_attribute("text") or "").strip().endswith(dong)]
+    picks = exact or candidates
+    if not picks:
+        driver.back()
+        return False
+    picks[0].click()
+    time.sleep(1.0)
+    return True
 
 
 def search_keyword(driver, keyword: str) -> None:
@@ -776,6 +861,23 @@ def save_csv(rows: list[dict], path: str) -> None:
         writer.writerows(rows)
 
 
+def gu_output_paths(gu: str, dong: str, keyword: str) -> tuple[str, str]:
+    """구 이름으로 된 폴더 아래 CSV/dedup 키 경로를 만든다(폴더 없으면 생성).
+
+    CSV는 동별로 나눈다(daangn_<검색어>_<구>_<동>.csv) — 이 동에서 실제로 뭐가
+    잡혔는지 구분해 보기 위해서다. dedup 키 파일은 반대로 동을 안 넣고 검색어+구로
+    묶어서 공유한다 — 인접 동을 2km 반경으로 겹쳐 수집해도 같은 매물이 여러 동
+    CSV에 중복으로 나뉘어 들어가지 않게 막으려는 목적(dedup 설계 자체는 이미
+    make_dedup_key가 동을 키에서 빼는 걸로 처리하고 있음). dong이 빈 문자열이면
+    (main()의 --dong은 선택 인자라서) 동 접미사 없이 구 단위 파일 하나로 합친다.
+    """
+    os.makedirs(gu, exist_ok=True)
+    suffix = f"_{dong}" if dong else ""
+    output = os.path.join(gu, f"daangn_{keyword}_{gu}{suffix}.csv")
+    keys_path = os.path.join(gu, f"daangn_{keyword}_{gu}.keys")
+    return output, keys_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="당근마켓 안드로이드 앱 크롤러 (Appium)")
     parser.add_argument("--udid", required=True, help="`adb devices`로 확인한 기기 시리얼")
@@ -791,7 +893,7 @@ def main():
     )
     parser.add_argument(
         "--output", default=None,
-        help="저장할 CSV 경로 (기본: daangn_<검색어>_<구>.csv, 이미 있으면 이어붙임)",
+        help="저장할 CSV 경로 (기본: <구>/daangn_<검색어>_<구>_<동>.csv, 이미 있으면 이어붙임)",
     )
     parser.add_argument(
         "--max-scrolls", type=int, default=MAX_SCROLLS,
@@ -804,10 +906,8 @@ def main():
     )
     args = parser.parse_args()
 
-    output = args.output or f"daangn_{args.keyword}_{args.gu}.csv"
-    # ponytail: keys 경로는 --output을 바꿔도 검색어+구 기준으로 고정 — 구 단위로 여러 번
-    # 나눠 돌려도(동마다 한 번씩) 같은 dedup 저장소를 계속 같이 쓰게 하려는 것
-    keys_path = f"daangn_{args.keyword}_{args.gu}.keys"
+    default_output, keys_path = gu_output_paths(args.gu, args.dong, args.keyword)
+    output = args.output or default_output
 
     if os.path.exists(keys_path):
         already_seen_keys = load_dedup_keys(keys_path)
