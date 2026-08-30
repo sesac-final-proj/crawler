@@ -234,6 +234,151 @@ def get_header_bottom(driver, window_height: int) -> int:
     return int(window_height * 0.18)  # 폴백: 탭을 못 찾으면 화면 비율로 어림
 
 
+def _find_dong_label(driver):
+    """홈 화면 상단의 활성 동네 라벨(예: "문래동")을 찾는다. 여러 개면 첫 번째.
+
+    resource-id가 없어서(웹뷰) content-desc가 동/구/읍/면/리로 끝나는 첫 View를
+    쓴다 — _LOCATION_RE는 매물 카드의 지역 파싱에도 쓰는 같은 패턴(실기기 확인).
+    """
+    for v in driver.find_elements(AppiumBy.CLASS_NAME, "android.view.View"):
+        desc = v.get_attribute("content-desc") or ""
+        if _LOCATION_RE.match(desc):
+            return v
+    return None
+
+
+def _go_home(driver, max_attempts: int = 4) -> None:
+    """검색/검색결과 화면 등 어디에 있든 홈 화면(동네 라벨이 보이는 화면)으로 돌아간다.
+
+    배치 러너(run_batch.py)처럼 crawl() 직후 검색결과 화면에 남아있는 상태에서
+    바로 다음 동으로 전환하려 할 때 필요하다 — switch_to_dong은 홈 화면의 동네
+    라벨을 눌러야 해서, 그 전에 반드시 홈으로 와 있어야 한다. 검색결과 화면의
+    "닫기" 버튼을 누르면 홈으로 바로 돌아가는 걸 실기기로 확인했다.
+    """
+    for _ in range(max_attempts):
+        if _find_dong_label(driver):
+            return
+        closes = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().text("닫기")')
+        if closes:
+            closes[0].click()
+        else:
+            driver.back()
+        time.sleep(0.8)
+
+
+def switch_to_dong(driver, dong: str) -> bool:
+    """이미 "내 동네"로 등록된 동네 중 하나로 활성 동네를 전환한다. 성공하면 True.
+
+    당근 앱은 최대 2개 동네까지만 등록되고, 새 동네를 등록하려면 GPS 기반 위치
+    인증이 필요하다(실기기로 "내 동네 설정" 확인) — 스크립트가 가보지 않은 동으로
+    새로 등록하는 건 원천적으로 불가능하다. 그래서 이 함수는 이미 등록된 동만
+    다루고, 없는 동이면 시트를 닫고 False를 반환한다 — 호출 쪽에서 "이 동은 폰에서
+    먼저 인증해서 등록해달라"고 안내해야 한다.
+    라디오버튼(class="android.widget.RadioButton")과 동 이름 텍스트가 같은 행에
+    나란히 있어서, 이름으로 찾은 텍스트의 y좌표와 겹치는 라디오를 눌러 전환한다
+    (resource-id가 없는 웹뷰라 이름↔라디오 매칭을 좌표로 할 수밖에 없음).
+    """
+    _go_home(driver)
+    label = _find_dong_label(driver)
+    if not label:
+        return False
+    label.click()
+    time.sleep(0.8)
+
+    target = next(
+        (tv for tv in driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+         if (tv.get_attribute("text") or "").strip() == dong),
+        None,
+    )
+    if not target:
+        driver.back()  # 등록 안 된 동 — 시트만 닫고 실패 반환
+        return False
+
+    ty = target.rect["y"] + target.rect["height"] / 2
+    for radio in driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.RadioButton"):
+        ry = radio.rect["y"]
+        if ry <= ty <= ry + radio.rect["height"]:
+            if radio.get_attribute("checked") == "true":
+                driver.back()  # 이미 그 동이면 시트만 닫음
+            else:
+                radio.click()
+                time.sleep(1.0)
+            return True
+    driver.back()
+    return False
+
+
+def search_keyword(driver, keyword: str) -> None:
+    """홈 화면 검색 아이콘을 눌러 keyword를 입력하고 검색을 실행한다.
+
+    검색창 EditText는 웹뷰라 resource-id가 세션마다 못 믿을 값이라(실기기 확인,
+    "search-focusable-input"이 매번 같게 나오긴 하지만 AppiumBy.ID 매칭은 실패했음)
+    클래스명으로 첫 번째 EditText를 잡는다. 검색 실행은 키보드의 "검색" 액션
+    버튼(mobile: performEditorAction)으로 — 엔터 키코드보다 이 웹뷰에서 안정적으로
+    동작함을 실기기로 확인했다.
+    """
+    icons = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().description("검색")')
+    if not icons:
+        return
+    icons[0].click()
+    # 웹뷰 로딩 시간이 실기기에서 0.3~0.8초로 들쭉날쭉해서 고정 sleep 대신 폴링한다
+    _wait_until(
+        driver, lambda d: len(d.find_elements(AppiumBy.CLASS_NAME, "android.widget.EditText")) > 0, DETAIL_WAIT_TIMEOUT
+    )
+    edits = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.EditText")
+    if not edits:
+        return
+    edits[0].send_keys(keyword)
+    driver.execute_script("mobile: performEditorAction", {"action": "search"})
+    time.sleep(1.2)
+
+
+def set_sort_latest(driver) -> None:
+    """중고거래 검색결과 정렬을 "추천순"에서 "최신순"으로 바꾼다.
+
+    매 검색마다 정렬은 항상 "추천순"으로 초기화돼 있다고 가정한다(실기기 확인) —
+    그래서 "추천순" chip이 안 보이면(이미 최신순 등으로 바뀐 상태) 그냥 넘어간다.
+    """
+    chip = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().text("추천순")')
+    if not chip:
+        return
+    chip[0].click()
+    time.sleep(0.8)
+    option = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().text("최신순")')
+    if option:
+        option[0].click()
+        time.sleep(0.8)
+
+
+def ensure_local_only_filter(driver) -> None:
+    """"동네매물만 보기" 체크박스를 켠다.
+
+    이 체크박스는 웹뷰 접근성 브릿지 특성상 checked 속성이 항상 false로 나와서
+    (실기기 확인, bounds도 [0,0][0,0]) 이미 켜져 있는지 판별할 수 없다 — 그래서
+    "새 검색 결과 화면에 진입한 직후 정확히 한 번만 호출"하는 걸 전제로, 텍스트가
+    보이면 무조건 한 번 누른다(매번 새로 검색하므로 초기값은 항상 꺼짐, 실기기 확인).
+    """
+    texts = driver.find_elements(AppiumBy.ANDROID_UIAUTOMATOR, 'new UiSelector().text("동네매물만 보기")')
+    if texts:
+        texts[0].click()
+        time.sleep(0.5)
+
+
+def auto_navigate_to_results(driver, keyword: str) -> None:
+    """홈 화면에서부터 검색 -> 중고거래 탭 -> 최신순 정렬 -> 동네매물만 보기까지 자동 처리.
+
+    직전 크롤링이 검색결과 화면에 남겨두고 끝났을 수 있어서(배치 러너가 키워드를
+    이어서 돌릴 때 흔함) 먼저 홈으로 돌아간 뒤 시작한다 — 홈이 아니면 검색 아이콘
+    selector가 안 잡혀 search_keyword가 조용히 아무 것도 안 하고 끝나버린다.
+    """
+    _go_home(driver)
+    search_keyword(driver, keyword)
+    ensure_flea_market_tab(driver)
+    time.sleep(0.5)
+    set_sort_latest(driver)
+    ensure_local_only_filter(driver)
+
+
 def recover_from_stray_keyboard(driver) -> None:
     """스크롤/탭이 잘못 튀어서 검색창이 눌리는 경우가 있어(실사용 중 확인), 키보드가
     떠 있으면 뒤로가기로 닫는다. 매 루프마다 호출해 크롤링이 계속 진행되게 함.
