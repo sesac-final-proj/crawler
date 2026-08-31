@@ -281,16 +281,21 @@ def _go_home(driver, max_attempts: int = 4) -> None:
         else:
             driver.back()
         time.sleep(0.8)
+    # 그래도 못 찾으면 화면이 예상 밖 상태로 샌 것(광고 팝업, 다른 액티비티 등) —
+    # 배치 실행 중 실제로 겪었다(공릉1동 다음부터 동 전체가 연쇄로 실패). 최후
+    # 수단으로 앱을 강제로 다시 포그라운드에 올린다.
+    try:
+        driver.execute_script("mobile: activateApp", {"appId": APP_PACKAGE})
+        time.sleep(1.5)
+    except WebDriverException:
+        pass
 
 
 def switch_to_dong(driver, dong: str) -> bool:
     """이미 "내 동네"로 등록된 동네 중 하나로 활성 동네를 전환한다. 성공하면 True.
 
-    당근 앱은 최대 2개 동네까지만 등록되고, 새 동네를 등록하려면 GPS 기반 위치
-    인증이 필요하다(실기기로 "내 동네 설정" 확인) — 스크립트가 가보지 않은 동으로
-    새로 등록하는 건 원천적으로 불가능하다. 그래서 이 함수는 이미 등록된 동만
-    다루고, 없는 동이면 시트를 닫고 False를 반환한다 — 호출 쪽에서 "이 동은 폰에서
-    먼저 인증해서 등록해달라"고 안내해야 한다.
+    등록 안 된 동이면 False — 새로 등록하려면 add_dong을 쓸 것(이 함수는 이미
+    등록된 동끼리 빠르게 전환만 할 때 쓴다).
     라디오버튼(class="android.widget.RadioButton")과 동 이름 텍스트가 같은 행에
     나란히 있어서, 이름으로 찾은 텍스트의 y좌표와 겹치는 라디오를 눌러 전환한다
     (resource-id가 없는 웹뷰라 이름↔라디오 매칭을 좌표로 할 수밖에 없음).
